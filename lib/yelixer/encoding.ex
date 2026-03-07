@@ -373,34 +373,10 @@ defmodule Yelixer.Encoding do
     # Filter out items we already have
     sv = BlockStore.state_vector(doc.store)
 
-    {doc, _} =
-      Enum.reduce(items, {doc, sv}, fn item, {doc, sv} ->
-        client_clock = StateVector.get(sv, item.id.client)
+    {doc, sv, pending} = integrate_items(items, doc, sv, [])
 
-        if item.id.clock < client_clock do
-          # Already have this item, skip
-          {doc, sv}
-        else
-          # Resolve inferred parent from origin/right_origin
-          item = resolve_parent(item, doc.store)
-          type_name = parent_type_name(item)
-
-          case type_name do
-            nil ->
-              # Can't integrate without a type name, just push to store
-              store = BlockStore.push(doc.store, item)
-              sv = StateVector.advance(sv, item.id.client, item.id.clock + item.length)
-              {%{doc | store: store}, sv}
-
-            name ->
-              # Ensure type exists
-              {doc, _} = Doc.get_or_create_type(doc, name, :unknown)
-              {:ok, store} = Integrate.integrate(doc.store, item, name)
-              sv = StateVector.advance(sv, item.id.client, item.id.clock + item.length)
-              {%{doc | store: store}, sv}
-          end
-        end
-      end)
+    # Retry pending items whose dependencies are now available
+    {doc, _sv} = retry_pending(doc, sv, pending)
 
     # Apply delete set
     doc =
@@ -414,6 +390,63 @@ defmodule Yelixer.Encoding do
       end)
 
     {:ok, doc}
+  end
+
+  defp integrate_items([], doc, sv, pending), do: {doc, sv, Enum.reverse(pending)}
+
+  defp integrate_items([item | rest], doc, sv, pending) do
+    client_clock = StateVector.get(sv, item.id.client)
+
+    if item.id.clock < client_clock do
+      # Already have this item, skip
+      integrate_items(rest, doc, sv, pending)
+    else
+      case try_integrate_item(item, doc, sv) do
+        {:ok, doc, sv} ->
+          integrate_items(rest, doc, sv, pending)
+
+        :pending ->
+          integrate_items(rest, doc, sv, [item | pending])
+      end
+    end
+  end
+
+  defp try_integrate_item(item, doc, sv) do
+    item = resolve_parent(item, doc.store)
+    type_name = parent_type_name(item)
+
+    case type_name do
+      nil ->
+        # Can't resolve parent yet — defer for retry
+        :pending
+
+      name ->
+        {doc, _} = Doc.get_or_create_type(doc, name, :unknown)
+        {:ok, store} = Integrate.integrate(doc.store, item, name)
+        sv = StateVector.advance(sv, item.id.client, item.id.clock + item.length)
+        {:ok, %{doc | store: store}, sv}
+    end
+  end
+
+  defp retry_pending(doc, sv, []), do: {doc, sv}
+
+  defp retry_pending(doc, sv, pending) do
+    {doc, sv, still_pending} = integrate_items(pending, doc, sv, [])
+
+    if length(still_pending) < length(pending) do
+      # Made progress, retry remaining
+      retry_pending(doc, sv, still_pending)
+    else
+      # No progress — push remaining items to store without sequence integration
+      {doc, sv} =
+        Enum.reduce(still_pending, {doc, sv}, fn item, {doc, sv} ->
+          store = BlockStore.push(doc.store, item)
+          sv = StateVector.advance(sv, item.id.client, item.id.clock + item.length)
+          {%{doc | store: store}, sv}
+        end)
+
+      {doc, sv}
+    end
   end
 
   defp parent_type_name(%Item{parent: {:named, name}}), do: name
