@@ -141,27 +141,50 @@ defmodule Yelixer.Encoding do
   #       content data
   #   delete_set
 
-  def encode_update(%Doc{store: store, delete_set: ds}) do
-    clients = store.clients
+  def encode_update(%Doc{} = doc) do
+    encode_diff(doc, StateVector.new())
+  end
 
-    # Sort clients by ID descending (Yjs convention)
-    sorted_clients =
-      clients
+  def encode_diff(%Doc{store: store, delete_set: ds}, %StateVector{} = remote_sv) do
+    local_sv = BlockStore.state_vector(store)
+
+    # Find clients where we have items the remote doesn't
+    diff_clients =
+      local_sv.clocks
+      |> Enum.filter(fn {client, local_clock} ->
+        StateVector.get(remote_sv, client) < local_clock
+      end)
       |> Enum.sort_by(fn {client, _} -> client end, :desc)
 
-    num_clients = length(sorted_clients)
+    num_clients = length(diff_clients)
 
     structs_bin =
-      Enum.reduce(sorted_clients, <<>>, fn {client, items}, acc ->
+      Enum.reduce(diff_clients, <<>>, fn {client, _local_clock}, acc ->
+        remote_clock = StateVector.get(remote_sv, client)
+        all_items = Map.get(store.clients, client, [])
+
+        # Filter to items at or after the remote clock
+        items =
+          Enum.filter(all_items, fn item ->
+            item.id.clock + item.length > remote_clock
+          end)
+
         if items == [] do
           acc
         else
-          first_clock = hd(items).id.clock
+          first_clock = max(hd(items).id.clock, remote_clock)
           num_items = length(items)
 
           items_bin =
             Enum.reduce(items, <<>>, fn item, iacc ->
-              <<iacc::binary, encode_item(item)::binary>>
+              if item.id.clock < remote_clock do
+                # Partial item — only encode the portion after remote_clock
+                offset = remote_clock - item.id.clock
+                {_left, right} = Item.split(item, offset)
+                <<iacc::binary, encode_item(right)::binary>>
+              else
+                <<iacc::binary, encode_item(item)::binary>>
+              end
             end)
 
           <<acc::binary, encode_uint(num_items)::binary, encode_uint(client)::binary,
