@@ -49,6 +49,17 @@ defmodule Yelixer.InteropTest do
     assert Text.to_string(doc2, "text") == "yelixer"
   end
 
+  test "decode complex multi-client Yjs update with deletions" do
+    update = File.read!("test/fixtures/complex_update.bin")
+    expected = String.trim(File.read!("test/fixtures/complex_expected.txt"))
+
+    doc = Doc.new(client_id: 99)
+    {doc, _} = Doc.get_or_create_type(doc, "text", :text)
+    {:ok, doc} = Encoding.apply_update(doc, update)
+
+    assert Text.to_string(doc, "text") == expected
+  end
+
   test "full roundtrip: Yelixer -> Yjs -> Yelixer" do
     # Yelixer generated an update, Yjs decoded it, made an edit, re-encoded
     update = File.read!("test/fixtures/roundtrip_yjs_update.bin")
