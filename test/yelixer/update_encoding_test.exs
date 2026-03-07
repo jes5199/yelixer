@@ -1,7 +1,7 @@
 defmodule Yelixer.UpdateEncodingTest do
   use ExUnit.Case, async: true
 
-  alias Yelixer.{Doc, Types.Text, Types.Array, Types.YMap, Encoding, StateVector, BlockStore}
+  alias Yelixer.{Doc, Types.Text, Types.Array, Encoding, StateVector, BlockStore}
 
   test "encode and decode update roundtrip — text" do
     doc1 = Doc.new(client_id: 1)
