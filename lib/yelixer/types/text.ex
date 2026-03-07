@@ -2,35 +2,28 @@ defmodule Yelixer.Types.Text do
   @moduledoc """
   Collaborative text type built on the YATA CRDT.
 
-  Each insert creates an Item with {:string, content} that gets integrated
-  into the document's sequence for the named type.
+  Inserts multi-character items. When inserting mid-item, the existing
+  item is split first. This matches yrs behavior for efficiency.
   """
 
   alias Yelixer.{Doc, ID, Item, BlockStore, Integrate, StateVector}
 
   @doc "Insert text at a character position."
   def insert(%Doc{} = doc, type_name, index, text) when is_binary(text) and byte_size(text) > 0 do
-    # Insert each character as a separate item for correct mid-item insertion.
-    # Each subsequent char uses the previous one as its origin.
-    text
-    |> String.graphemes()
-    |> Enum.with_index()
-    |> Enum.reduce(doc, fn {char, i}, doc ->
-      {origin, right_origin} = find_origins(doc.store, type_name, index + i)
-      clock = StateVector.get(BlockStore.state_vector(doc.store), doc.client_id)
-      id = ID.new(doc.client_id, clock)
-      item = Item.new(id, origin, right_origin, {:string, char}, {:named, type_name}, nil)
-      {:ok, store} = Integrate.integrate(doc.store, item, type_name)
-      %{doc | store: store}
-    end)
+    {store, origin, right_origin} = find_origins_with_split(doc.store, type_name, index)
+    clock = StateVector.get(BlockStore.state_vector(store), doc.client_id)
+    id = ID.new(doc.client_id, clock)
+    item = Item.new(id, origin, right_origin, {:string, text}, {:named, type_name}, nil)
+    {:ok, store} = Integrate.integrate(store, item, type_name)
+    %{doc | store: store}
   end
 
   @doc "Delete `len` characters starting at `index`."
   def delete(%Doc{} = doc, type_name, index, len) when len > 0 do
-    items_to_delete = find_items_in_range(doc.store, type_name, index, len)
+    {store, ids_to_delete} = find_items_in_range_with_split(doc.store, type_name, index, len)
 
     store =
-      Enum.reduce(items_to_delete, doc.store, fn id, store ->
+      Enum.reduce(ids_to_delete, store, fn id, store ->
         Integrate.mark_deleted(store, id)
       end)
 
@@ -52,15 +45,14 @@ defmodule Yelixer.Types.Text do
     |> Enum.reduce(0, fn %Item{length: len}, acc -> acc + len end)
   end
 
-  # Find the origin (left neighbor) and right_origin (right neighbor)
-  # for an insertion at a given character index.
-  defp find_origins(store, type_name, index) do
+  # Find origins, splitting an existing item if inserting mid-item.
+  defp find_origins_with_split(store, type_name, index) do
     seq = BlockStore.get_sequence(store, type_name)
 
     if index == 0 and seq == [] do
-      {nil, nil}
+      {store, nil, nil}
     else
-      {left_item, right_item} = find_neighbors(seq, index)
+      {store, left_item, right_item} = find_neighbors_with_split(store, seq, type_name, index)
 
       origin =
         case left_item do
@@ -74,62 +66,83 @@ defmodule Yelixer.Types.Text do
           %Item{id: id} -> id
         end
 
-      {origin, right_origin}
+      {store, origin, right_origin}
     end
   end
 
-  # Walk through items to find the left and right neighbors at a character index.
-  defp find_neighbors(items, index) do
-    find_neighbors(items, index, 0, nil)
+  defp find_neighbors_with_split(store, items, type_name, index) do
+    do_find_neighbors(store, items, type_name, index, 0, nil)
   end
 
-  defp find_neighbors([], _index, _pos, left), do: {left, nil}
+  defp do_find_neighbors(store, [], _type_name, _index, _pos, left) do
+    {store, left, nil}
+  end
 
-  defp find_neighbors([item | rest], index, pos, left) do
+  defp do_find_neighbors(store, [item | rest], type_name, index, pos, left) do
     item_end = pos + item.length
 
     cond do
       index <= pos ->
-        {left, item}
+        {store, left, item}
 
       index >= item_end ->
-        find_neighbors(rest, index, item_end, item)
+        do_find_neighbors(store, rest, type_name, index, item_end, item)
 
       true ->
-        # Index falls within this item — need to split conceptually
-        # The origin is within this item at the given offset
-        # For simplicity, we treat the whole item as origin
-        # TODO: Item splitting for mid-item insertions
-        {item, List.first(rest)}
+        # Index falls within this item — split it
+        offset = index - pos
+        split_clock = item.id.clock + offset
+        {store, right} = BlockStore.split_block(store, ID.new(item.id.client, split_clock), type_name)
+        left_after_split = BlockStore.get(store, item.id)
+        {store, left_after_split, right}
     end
   end
 
-  # Find item IDs that cover a character range for deletion.
-  defp find_items_in_range(store, type_name, index, len) do
+  # Find item IDs in a character range, splitting at boundaries as needed.
+  defp find_items_in_range_with_split(store, type_name, index, len) do
     seq = BlockStore.get_sequence(store, type_name)
-    collect_ids_in_range(seq, index, len, 0, [])
+    do_collect_ids(store, seq, type_name, index, len, 0, [])
   end
 
-  defp collect_ids_in_range(_, _, 0, _, acc), do: Enum.reverse(acc)
-  defp collect_ids_in_range([], _, _, _, acc), do: Enum.reverse(acc)
+  defp do_collect_ids(store, _, _, _, 0, _, acc), do: {store, Enum.reverse(acc)}
+  defp do_collect_ids(store, [], _, _, _, _, acc), do: {store, Enum.reverse(acc)}
 
-  defp collect_ids_in_range([item | rest], index, remaining, pos, acc) do
+  defp do_collect_ids(store, [item | rest], type_name, index, remaining, pos, acc) do
     item_end = pos + item.length
 
     cond do
       item_end <= index ->
-        collect_ids_in_range(rest, index, remaining, item_end, acc)
+        # Before the range, skip
+        do_collect_ids(store, rest, type_name, index, remaining, item_end, acc)
+
+      pos >= index and item.length <= remaining ->
+        # Entire item is within range
+        do_collect_ids(store, rest, type_name, index, remaining - item.length, item_end, [
+          item.id | acc
+        ])
 
       pos >= index ->
-        # Entire item is in range
-        to_take = min(item.length, remaining)
-        collect_ids_in_range(rest, index, remaining - to_take, item_end, [item.id | acc])
+        # Item extends beyond range — split at end of deletion range
+        split_clock = item.id.clock + remaining
+        {store, _right} = BlockStore.split_block(store, ID.new(item.id.client, split_clock), type_name)
+        {store, Enum.reverse([item.id | acc])}
 
       true ->
-        # Partial overlap — for now, delete the whole item
-        # TODO: Item splitting
-        to_take = min(item_end - index, remaining)
-        collect_ids_in_range(rest, index, remaining - to_take, item_end, [item.id | acc])
+        # Partial overlap at start — split at start of range
+        split_clock = item.id.clock + (index - pos)
+        {store, right} = BlockStore.split_block(store, ID.new(item.id.client, split_clock), type_name)
+
+        if right.length <= remaining do
+          # Take the whole right piece and continue
+          new_seq = BlockStore.get_sequence(store, type_name)
+          # Re-walk from the split point
+          do_collect_ids(store, new_seq, type_name, index, remaining, 0, acc)
+        else
+          # Need to also split at the end
+          split_end = right.id.clock + remaining
+          {store, _} = BlockStore.split_block(store, ID.new(right.id.client, split_end), type_name)
+          {store, [right.id]}
+        end
     end
   end
 end

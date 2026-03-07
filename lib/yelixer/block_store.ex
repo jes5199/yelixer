@@ -41,6 +41,47 @@ defmodule Yelixer.BlockStore do
     %{store | sequences: Map.put(store.sequences, type_name, seq)}
   end
 
+  def split_block(%__MODULE__{} = store, %ID{client: client, clock: clock}, type_name) do
+    item = get(store, %ID{client: client, clock: clock})
+
+    if item == nil do
+      {store, nil}
+    else
+      if item.id.clock == clock do
+        {store, item}
+      else
+        offset = clock - item.id.clock
+        {left, right} = Item.split(item, offset)
+
+        clients =
+          Map.update!(store.clients, client, fn blocks ->
+            idx = Enum.find_index(blocks, &(&1.id == item.id))
+
+            blocks
+            |> List.replace_at(idx, left)
+            |> List.insert_at(idx + 1, right)
+          end)
+
+        sequences =
+          case Map.get(store.sequences, type_name) do
+            nil ->
+              store.sequences
+
+            seq ->
+              idx = Enum.find_index(seq, &(&1 == item.id))
+
+              if idx != nil do
+                Map.put(store.sequences, type_name, List.insert_at(seq, idx + 1, right.id))
+              else
+                store.sequences
+              end
+          end
+
+        {%{store | clients: clients, sequences: sequences}, right}
+      end
+    end
+  end
+
   def get_sequence(%__MODULE__{} = store, type_name) do
     store.sequences
     |> Map.get(type_name, [])

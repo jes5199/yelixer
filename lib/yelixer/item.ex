@@ -40,6 +40,60 @@ defmodule Yelixer.Item do
     }
   end
 
+  @doc """
+  Split an item at a given offset, returning {left, right}.
+  Left keeps the original ID with reduced length.
+  Right gets ID {client, clock + offset} with origin = end of left.
+  """
+  def split(%__MODULE__{} = item, offset) when offset > 0 and offset < item.length do
+    {left_content, right_content} = split_content(item.content, offset)
+
+    right_id = ID.new(item.id.client, item.id.clock + offset)
+
+    left = %{item |
+      content: left_content,
+      length: content_length(left_content),
+      right_origin: right_id
+    }
+
+    right = %__MODULE__{
+      id: right_id,
+      origin: ID.new(item.id.client, item.id.clock + offset - 1),
+      right_origin: item.right_origin,
+      content: right_content,
+      parent: item.parent,
+      parent_sub: item.parent_sub,
+      deleted: item.deleted,
+      length: content_length(right_content)
+    }
+
+    {left, right}
+  end
+
+  defp split_content({:string, s}, offset) do
+    {left, right} = String.split_at(s, offset)
+    {{:string, left}, {:string, right}}
+  end
+
+  defp split_content({:any, list}, offset) do
+    {left, right} = Enum.split(list, offset)
+    {{:any, left}, {:any, right}}
+  end
+
+  defp split_content({:deleted, n}, offset) do
+    {{:deleted, offset}, {:deleted, n - offset}}
+  end
+
+  defp split_content({:json, list}, offset) do
+    {left, right} = Enum.split(list, offset)
+    {{:json, left}, {:json, right}}
+  end
+
+  defp split_content({:binary, b}, offset) do
+    <<left::binary-size(offset), right::binary>> = b
+    {{:binary, left}, {:binary, right}}
+  end
+
   defp content_length({:string, s}), do: String.length(s)
   defp content_length({:any, list}), do: length(list)
   defp content_length({:binary, b}), do: byte_size(b)

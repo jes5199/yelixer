@@ -55,6 +55,41 @@ defmodule Yelixer.BlockStoreTest do
     assert BlockStore.get(bs, ID.new(1, 2)).content == {:string, "c"}
   end
 
+  describe "split_block/3" do
+    test "splits a multi-char item in clients and sequences" do
+      item = Item.new(ID.new(1, 0), nil, nil, {:string, "hello"}, {:named, "text"}, nil)
+      bs = BlockStore.insert_at(BlockStore.new(), "text", 0, item)
+
+      {bs, right} = BlockStore.split_block(bs, ID.new(1, 2), "text")
+
+      # Left piece in clients
+      left = BlockStore.get(bs, ID.new(1, 0))
+      assert left.content == {:string, "he"}
+      assert left.length == 2
+
+      # Right piece in clients
+      assert right.id == ID.new(1, 2)
+      assert right.content == {:string, "llo"}
+      assert right.length == 3
+
+      # Both in sequence
+      seq = Map.get(bs.sequences, "text")
+      assert length(seq) == 2
+      assert Enum.at(seq, 0) == ID.new(1, 0)
+      assert Enum.at(seq, 1) == ID.new(1, 2)
+    end
+
+    test "returns item unchanged when offset is at item boundary" do
+      item = Item.new(ID.new(1, 0), nil, nil, {:string, "hi"}, {:named, "text"}, nil)
+      bs = BlockStore.insert_at(BlockStore.new(), "text", 0, item)
+
+      # Clock 0 is at the start, no split needed
+      {bs2, found} = BlockStore.split_block(bs, ID.new(1, 0), "text")
+      assert found.id == ID.new(1, 0)
+      assert bs2 == bs
+    end
+  end
+
   test "client_blocks returns blocks for a specific client" do
     bs =
       BlockStore.new()

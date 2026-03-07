@@ -58,4 +58,52 @@ defmodule Yelixer.ItemTest do
     item = Item.new(ID.new(1, 0), nil, nil, {:any, [42]}, {:named, "map"}, "key")
     assert item.parent_sub == "key"
   end
+
+  describe "split/2" do
+    test "splits string item at offset" do
+      item = Item.new(ID.new(1, 0), nil, ID.new(2, 0), {:string, "hello"}, {:named, "text"}, nil)
+      {left, right} = Item.split(item, 2)
+
+      assert left.id == ID.new(1, 0)
+      assert left.content == {:string, "he"}
+      assert left.length == 2
+      assert left.origin == nil
+      assert left.right_origin == right.id
+
+      assert right.id == ID.new(1, 2)
+      assert right.content == {:string, "llo"}
+      assert right.length == 3
+      assert right.origin == ID.new(1, 1)
+      assert right.right_origin == ID.new(2, 0)
+    end
+
+    test "splits any content at offset" do
+      item = Item.new(ID.new(1, 0), nil, nil, {:any, [1, 2, 3, 4]}, {:named, "arr"}, nil)
+      {left, right} = Item.split(item, 2)
+
+      assert left.content == {:any, [1, 2]}
+      assert left.length == 2
+      assert right.content == {:any, [3, 4]}
+      assert right.length == 2
+      assert right.id == ID.new(1, 2)
+    end
+
+    test "splits deleted content at offset" do
+      item = Item.new(ID.new(1, 0), nil, nil, {:deleted, 5}, {:named, "text"}, nil)
+      {left, right} = Item.split(item, 3)
+
+      assert left.content == {:deleted, 3}
+      assert left.length == 3
+      assert right.content == {:deleted, 2}
+      assert right.length == 2
+    end
+
+    test "preserves parent through split" do
+      item = Item.new(ID.new(1, 0), nil, nil, {:string, "abc"}, {:named, "text"}, nil)
+      {left, right} = Item.split(item, 1)
+
+      assert left.parent == {:named, "text"}
+      assert right.parent == {:named, "text"}
+    end
+  end
 end
