@@ -7,6 +7,7 @@ defmodule Yelixer.Encoding do
   alias Yelixer.{StateVector, DeleteSet, ID, Item, BlockStore, Doc, Integrate}
 
   # Content type refs (matching Yjs V1 format)
+  @content_ref_gc 0
   @content_ref_deleted 1
   @content_ref_json 2
   @content_ref_binary 3
@@ -181,9 +182,9 @@ defmodule Yelixer.Encoding do
                 # Partial item — only encode the portion after remote_clock
                 offset = remote_clock - item.id.clock
                 {_left, right} = Item.split(item, offset)
-                <<iacc::binary, encode_item(right)::binary>>
+                <<iacc::binary, encode_item(right, store)::binary>>
               else
-                <<iacc::binary, encode_item(item)::binary>>
+                <<iacc::binary, encode_item(item, store)::binary>>
               end
             end)
 
@@ -197,43 +198,50 @@ defmodule Yelixer.Encoding do
     <<encode_uint(num_clients)::binary, structs_bin::binary, ds_bin::binary>>
   end
 
-  defp encode_item(%Item{} = item) do
+  defp encode_item(%Item{content: {:gc, n}}, _store) do
+    # GC blocks: just info byte (0) + length
+    <<@content_ref_gc, encode_uint(n)::binary>>
+  end
+
+  defp encode_item(%Item{} = item, store) do
     content_ref = content_type_ref(item.content)
+
+    # Remap refs through GC/deleted blocks to nearest non-GC neighbors
+    origin = remap_gc_origin(item.origin, store)
+    right_origin = remap_gc_right_origin(item.right_origin, store)
 
     info =
       content_ref
-      |> Bitwise.bor(if item.origin != nil, do: @has_origin, else: 0)
-      |> Bitwise.bor(if item.right_origin != nil, do: @has_right_origin, else: 0)
+      |> Bitwise.bor(if origin != nil, do: @has_origin, else: 0)
+      |> Bitwise.bor(if right_origin != nil, do: @has_right_origin, else: 0)
       |> Bitwise.bor(if item.parent_sub != nil, do: @has_parent_sub, else: 0)
 
     bin = <<info>>
 
     # Write origin
     bin =
-      if item.origin != nil do
-        <<bin::binary, encode_id(item.origin)::binary>>
+      if origin != nil do
+        <<bin::binary, encode_id(origin)::binary>>
       else
         bin
       end
 
     # Write right_origin
     bin =
-      if item.right_origin != nil do
-        <<bin::binary, encode_id(item.right_origin)::binary>>
+      if right_origin != nil do
+        <<bin::binary, encode_id(right_origin)::binary>>
       else
         bin
       end
 
     # Write parent if no origin and no right_origin
     bin =
-      if item.origin == nil and item.right_origin == nil do
+      if origin == nil and right_origin == nil do
         case item.parent do
           {:named, name} ->
-            # parent info = true (named)
             <<bin::binary, encode_uint(1)::binary, encode_string(name)::binary>>
 
           {:id, id} ->
-            # parent info = false (id)
             <<bin::binary, encode_uint(0)::binary, encode_id(id)::binary>>
         end
       else
@@ -252,6 +260,39 @@ defmodule Yelixer.Encoding do
     <<bin::binary, encode_content(item.content)::binary>>
   end
 
+  # Returns the ID if the referenced item is NOT a GC block, nil otherwise
+  # Remap origin (left ref) through GC/deleted blocks to nearest non-GC predecessor
+  defp remap_gc_origin(nil, _store), do: nil
+
+  defp remap_gc_origin(%ID{} = id, store) do
+    case BlockStore.get(store, id) do
+      %Item{deleted: true} ->
+        # Find last non-deleted item before this one from same client
+        blocks = BlockStore.client_blocks(store, id.client)
+
+        blocks
+        |> Enum.filter(fn b -> b.id.clock + b.length - 1 < id.clock and not b.deleted end)
+        |> List.last()
+        |> case do
+          nil -> nil
+          %Item{id: bid, length: len} -> ID.new(bid.client, bid.clock + len - 1)
+        end
+
+      _ ->
+        id
+    end
+  end
+
+  # Clear right_origin when it points to a GC/deleted block
+  defp remap_gc_right_origin(nil, _store), do: nil
+
+  defp remap_gc_right_origin(%ID{} = id, store) do
+    case BlockStore.get(store, id) do
+      %Item{deleted: true} -> nil
+      _ -> id
+    end
+  end
+
   defp encode_id(%ID{client: client, clock: clock}) do
     <<encode_uint(client)::binary, encode_uint(clock)::binary>>
   end
@@ -262,6 +303,7 @@ defmodule Yelixer.Encoding do
     {ID.new(client, clock), rest}
   end
 
+  defp content_type_ref({:gc, _}), do: @content_ref_gc
   defp content_type_ref({:deleted, _}), do: @content_ref_deleted
   defp content_type_ref({:json, _}), do: @content_ref_json
   defp content_type_ref({:binary, _}), do: @content_ref_binary
@@ -271,6 +313,7 @@ defmodule Yelixer.Encoding do
   defp content_type_ref({:type, _}), do: @content_ref_type
   defp content_type_ref({:any, _}), do: @content_ref_any
 
+  defp encode_content({:gc, n}), do: encode_uint(n)
   defp encode_content({:string, s}), do: encode_string(s)
   defp encode_content({:deleted, n}), do: encode_uint(n)
   defp encode_content({:any, values}), do: encode_any_list(values)
@@ -434,6 +477,13 @@ defmodule Yelixer.Encoding do
     end
   end
 
+  defp try_integrate_item(%Item{content: {:gc, _}} = item, doc, sv) do
+    # GC blocks just go into the store, not into any type sequence
+    store = BlockStore.push(doc.store, item)
+    sv = StateVector.advance(sv, item.id.client, item.id.clock + item.length)
+    {:ok, %{doc | store: store}, sv}
+  end
+
   defp try_integrate_item(item, doc, sv) do
     item = resolve_parent(item, doc.store)
     type_name = parent_type_name(item)
@@ -477,12 +527,37 @@ defmodule Yelixer.Encoding do
 
   defp resolve_parent(%Item{parent: {:infer, ref_id}} = item, store) when not is_nil(ref_id) do
     case BlockStore.get(store, ref_id) do
-      nil -> item
-      ref_item -> %{item | parent: ref_item.parent}
+      nil ->
+        item
+
+      ref_item ->
+        case ref_item.parent do
+          {:gc_placeholder, _} ->
+            # Origin is a GC block — find a non-GC sibling from same client
+            case find_parent_from_siblings(store, ref_id.client) do
+              nil -> item
+              parent -> %{item | parent: parent}
+            end
+
+          parent ->
+            %{item | parent: parent}
+        end
     end
   end
 
   defp resolve_parent(item, _store), do: item
+
+  defp find_parent_from_siblings(store, client) do
+    store
+    |> BlockStore.client_blocks(client)
+    |> Enum.find_value(fn item ->
+      case item.parent do
+        {:named, _} = p -> p
+        {:id, _} = p -> p
+        _ -> nil
+      end
+    end)
+  end
 
   def decode_update(binary) do
     {num_clients, rest} = decode_uint(binary)
@@ -506,6 +581,13 @@ defmodule Yelixer.Encoding do
   defp decode_structs(binary, remaining, client, clock, acc) do
     {item, rest, next_clock} = decode_struct(binary, client, clock)
     decode_structs(rest, remaining - 1, client, next_clock, [item | acc])
+  end
+
+  defp decode_struct(<<@content_ref_gc, rest::binary>>, client, clock) do
+    # GC blocks: just info byte (0) + length, no origin/parent/content
+    {len, rest} = decode_uint(rest)
+    item = Item.new(ID.new(client, clock), nil, nil, {:gc, len}, {:gc_placeholder, nil}, nil)
+    {item, rest, clock + len}
   end
 
   defp decode_struct(<<info, rest::binary>>, client, clock) do

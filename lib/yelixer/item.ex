@@ -6,6 +6,7 @@ defmodule Yelixer.Item do
           | {:any, list()}
           | {:binary, binary()}
           | {:deleted, non_neg_integer()}
+          | {:gc, non_neg_integer()}
           | {:embed, term()}
           | {:format, {String.t(), term()}}
           | {:type, atom()}
@@ -35,7 +36,7 @@ defmodule Yelixer.Item do
       content: content,
       parent: parent,
       parent_sub: parent_sub,
-      deleted: match?({:deleted, _}, content),
+      deleted: match?({:deleted, _}, content) or match?({:gc, _}, content),
       length: content_length(content)
     }
   end
@@ -94,6 +95,7 @@ defmodule Yelixer.Item do
     {{:binary, left}, {:binary, right}}
   end
 
+  defp content_length({:gc, n}), do: n
   defp content_length({:string, s}), do: String.length(s)
   defp content_length({:any, list}), do: length(list)
   defp content_length({:binary, b}), do: byte_size(b)

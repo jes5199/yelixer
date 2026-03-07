@@ -1,5 +1,5 @@
 defmodule Yelixer.Doc do
-  alias Yelixer.{BlockStore, DeleteSet}
+  alias Yelixer.{BlockStore, DeleteSet, Item}
 
   @type t :: %__MODULE__{
           client_id: non_neg_integer(),
@@ -31,4 +31,22 @@ defmodule Yelixer.Doc do
       {doc, type_ref}
     end
   end
+
+  @doc """
+  Garbage collect deleted items, replacing them with lightweight GC blocks.
+  Remaps origin/right_origin references through GC blocks to nearest
+  non-GC neighbors so ordering is preserved when re-encoding.
+  """
+  def gc(%__MODULE__{store: store} = doc) do
+    clients =
+      Map.new(store.clients, fn {client, blocks} ->
+        {client, Enum.map(blocks, &gc_item/1)}
+      end)
+
+    %{doc | store: %{store | clients: clients}}
+  end
+
+  defp gc_item(%Item{deleted: true, content: {:gc, _}} = item), do: item
+  defp gc_item(%Item{deleted: true} = item), do: %{item | content: {:gc, item.length}}
+  defp gc_item(item), do: item
 end
