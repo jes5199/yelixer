@@ -15,9 +15,54 @@ defmodule Yelixer.Integrate do
   determined by the YATA algorithm.
   """
   def integrate(%BlockStore{} = store, %Item{} = item, type_name) do
+    # Split items at origin/right_origin boundaries if they point mid-item
+    store = maybe_split_at_origin(store, item.origin, type_name)
+    store = maybe_split_at_right_origin(store, item.right_origin, type_name)
     index = find_insertion_index(store, item, type_name)
+
     store = BlockStore.insert_at(store, type_name, index, item)
     {:ok, store}
+  end
+
+  # Split an item if origin points into its middle (not at its last clock)
+  defp maybe_split_at_origin(store, nil, _type_name), do: store
+
+  defp maybe_split_at_origin(store, %ID{} = origin_id, type_name) do
+    case BlockStore.get(store, origin_id) do
+      nil ->
+        store
+
+      item ->
+        last_clock = item.id.clock + item.length - 1
+
+        if origin_id.clock < last_clock do
+          # Origin is not at the last char — split after origin
+          split_clock = origin_id.clock + 1
+          {store, _} = BlockStore.split_block(store, ID.new(origin_id.client, split_clock), type_name)
+          store
+        else
+          store
+        end
+    end
+  end
+
+  # Split an item if right_origin points into its middle (not at its first clock)
+  defp maybe_split_at_right_origin(store, nil, _type_name), do: store
+
+  defp maybe_split_at_right_origin(store, %ID{} = ro_id, type_name) do
+    case BlockStore.get(store, ro_id) do
+      nil ->
+        store
+
+      item ->
+        if ro_id.clock > item.id.clock do
+          # Right_origin is not at the first char — split at right_origin
+          {store, _} = BlockStore.split_block(store, ro_id, type_name)
+          store
+        else
+          store
+        end
+    end
   end
 
   @doc """
@@ -89,60 +134,97 @@ defmodule Yelixer.Integrate do
     end
   end
 
-  # YATA conflict resolution loop.
+  # YATA conflict resolution using the two-set algorithm from yrs.
   # Scans items between start_index and end_index to find the correct position.
-  defp resolve_conflicts(_store, _item, _seq_ids, index, end_index) when index >= end_index do
-    index
+  # Tracks items_before_origin (all scanned items) and conflicting_items
+  # (items since last "winner" decision).
+  defp resolve_conflicts(store, item, seq_ids, start_index, end_index) do
+    do_resolve(store, item, seq_ids, start_index, end_index, start_index,
+      MapSet.new(), MapSet.new())
   end
 
-  defp resolve_conflicts(store, item, seq_ids, index, end_index) do
+  defp do_resolve(_store, _item, _seq_ids, index, end_index, left_index, _ibo, _ci)
+       when index >= end_index do
+    left_index
+  end
+
+  defp do_resolve(store, item, seq_ids, index, end_index, left_index, items_before_origin, conflicting_items) do
     other_id = Enum.at(seq_ids, index)
     other = BlockStore.get(store, other_id)
 
-    cond do
-      other == nil ->
-        index
+    if other == nil do
+      left_index
+    else
+      # Add this item to both sets
+      items_before_origin = MapSet.put(items_before_origin, other_id)
+      conflicting_items = MapSet.put(conflicting_items, other_id)
 
-      # Case 1: Same origin — compare client IDs
-      # In YATA: lower client ID goes first (to the left)
-      other.origin == item.origin ->
-        cond do
-          # We have lower client ID — insert before other
-          item.id.client < other.id.client ->
-            index
+      cond do
+        # Case 1: Same origin — compare client IDs
+        other.origin == item.origin ->
+          cond do
+            # Other has lower client ID — self goes AFTER other
+            other.id.client < item.id.client ->
+              # Move left past other, clear conflicting_items
+              do_resolve(store, item, seq_ids, index + 1, end_index, index + 1,
+                items_before_origin, MapSet.new())
 
-          # Same client ID or higher, but same right_origin — we're already positioned
-          item.id.client > other.id.client ->
-            # Other has lower client ID, skip past it
-            resolve_conflicts(store, item, seq_ids, index + 1, end_index)
+            # Same right_origin — self is to the left of other, break
+            item.right_origin == other.right_origin ->
+              left_index
 
-          # Same client ID (shouldn't happen in practice) and same right_origin
-          item.right_origin == other.right_origin ->
-            index
+            # Other has higher client ID — continue scanning
+            true ->
+              do_resolve(store, item, seq_ids, index + 1, end_index, left_index,
+                items_before_origin, conflicting_items)
+          end
 
-          true ->
-            resolve_conflicts(store, item, seq_ids, index + 1, end_index)
-        end
+        # Case 2: Different origin
+        true ->
+          case other.origin do
+            nil ->
+              # Can't find other's origin — break
+              left_index
 
-      # Case 2: Different origin — check if other's origin is before us
-      true ->
-        case other.origin do
-          nil ->
-            # Other has no origin, it breaks out
-            index
+            other_origin ->
+              # Find the actual item other.origin points to
+              other_origin_seq_id = find_origin_seq_id(seq_ids, store, other_origin)
 
-          other_origin ->
-            other_origin_idx = find_id_index(seq_ids, store, other_origin)
+              cond do
+                other_origin_seq_id == nil ->
+                  # Can't find other's origin in sequence — break
+                  left_index
 
-            if other_origin_idx != nil and other_origin_idx < index do
-              # Other's origin is in items_before_origin but not in conflicting_items
-              # Move past it
-              resolve_conflicts(store, item, seq_ids, index + 1, end_index)
-            else
-              index
-            end
-        end
+                MapSet.member?(items_before_origin, other_origin_seq_id) ->
+                  if MapSet.member?(conflicting_items, other_origin_seq_id) do
+                    # Origin is in conflicting_items — continue scanning
+                    do_resolve(store, item, seq_ids, index + 1, end_index, left_index,
+                      items_before_origin, conflicting_items)
+                  else
+                    # Origin is in items_before_origin but NOT in conflicting_items
+                    # Move left past other, clear conflicting_items
+                    do_resolve(store, item, seq_ids, index + 1, end_index, index + 1,
+                      items_before_origin, MapSet.new())
+                  end
+
+                true ->
+                  # Origin is NOT in items_before_origin — break
+                  left_index
+              end
+          end
+      end
     end
+  end
+
+  # Find the sequence ID for an origin reference (handles multi-char items)
+  defp find_origin_seq_id(seq_ids, store, %ID{} = target_id) do
+    Enum.find(seq_ids, fn seq_id ->
+      item = BlockStore.get(store, seq_id)
+      item != nil and
+        item.id.client == target_id.client and
+        target_id.clock >= item.id.clock and
+        target_id.clock < item.id.clock + item.length
+    end)
   end
 
   # Find the index in the sequence where an ID lives.

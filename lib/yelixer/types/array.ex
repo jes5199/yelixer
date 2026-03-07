@@ -44,6 +44,29 @@ defmodule Yelixer.Types.Array do
     |> Enum.flat_map(fn %Item{content: {:any, values}} -> values end)
   end
 
+  @doc "Convert array to JSON-compatible list, resolving nested types."
+  def to_json(%Doc{} = doc, type_key) do
+    doc.store
+    |> BlockStore.get_sequence(type_key)
+    |> Enum.flat_map(&item_to_json_values(doc, &1))
+  end
+
+  defp item_to_json_values(doc, %Item{content: {:any, values}}) do
+    Enum.map(values, &Yelixer.Types.resolve_content_value(doc, &1))
+  end
+
+  defp item_to_json_values(doc, %Item{content: {:type, _ref}, id: id}) do
+    [Yelixer.Types.sub_type_to_json(doc, id)]
+  end
+
+  defp item_to_json_values(doc, %Item{content: {:string, s}}) do
+    [Yelixer.Types.resolve_content_value(doc, s)]
+  end
+
+  defp item_to_json_values(_doc, %Item{content: {:embed, v}}), do: [v]
+  defp item_to_json_values(_doc, %Item{content: {:json, values}}), do: values
+  defp item_to_json_values(_doc, _item), do: []
+
   @doc "Get the number of elements."
   def length(%Doc{} = doc, type_name) do
     doc.store

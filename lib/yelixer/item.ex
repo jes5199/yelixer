@@ -85,6 +85,10 @@ defmodule Yelixer.Item do
     {{:deleted, offset}, {:deleted, n - offset}}
   end
 
+  defp split_content({:gc, n}, offset) do
+    {{:gc, offset}, {:gc, n - offset}}
+  end
+
   defp split_content({:json, list}, offset) do
     {left, right} = Enum.split(list, offset)
     {{:json, left}, {:json, right}}

@@ -52,6 +52,61 @@ defmodule Yelixer.Types.YMap do
     end)
   end
 
+  @doc "Convert map to JSON-compatible map, resolving nested types."
+  def to_json(%Doc{} = doc, type_key) do
+    find_all_items_for_type(doc.store, type_key)
+    |> Enum.filter(fn %Item{parent_sub: sub, deleted: deleted} ->
+      sub != nil and not deleted
+    end)
+    |> Enum.reduce(%{}, fn %Item{parent_sub: key} = item, acc ->
+      Map.put(acc, key, item_value_to_json(doc, item))
+    end)
+  end
+
+  defp item_value_to_json(doc, %Item{content: {:any, values}}) do
+    case values do
+      [single] -> Yelixer.Types.resolve_content_value(doc, single)
+      list -> Enum.map(list, &Yelixer.Types.resolve_content_value(doc, &1))
+    end
+  end
+
+  defp item_value_to_json(doc, %Item{content: {:type, _ref}, id: id}) do
+    Yelixer.Types.sub_type_to_json(doc, id)
+  end
+
+  defp item_value_to_json(_doc, %Item{content: {:string, s}}), do: s
+  defp item_value_to_json(_doc, %Item{content: {:embed, v}}), do: v
+  defp item_value_to_json(_doc, _item), do: nil
+
+  defp find_all_items_for_type(store, type_key) do
+    # Check sequence first (for items integrated into the type)
+    seq_items = BlockStore.get_sequence(store, type_key)
+
+    if seq_items != [] do
+      seq_items
+    else
+      # Fallback: scan all items for matching parent
+      parent_match = match_parent(type_key)
+
+      store.clients
+      |> Enum.flat_map(fn {_client, items} -> items end)
+      |> Enum.filter(fn item -> parent_match.(item.parent) end)
+    end
+  end
+
+  defp match_parent("__sub:" <> _ = key) do
+    fn parent ->
+      case parent do
+        {:id, %Yelixer.ID{client: c, clock: k}} -> "__sub:#{c}:#{k}" == key
+        _ -> false
+      end
+    end
+  end
+
+  defp match_parent(name) do
+    fn parent -> parent == {:named, name} end
+  end
+
   defp find_current_item(store, type_name, key) do
     store.clients
     |> Enum.flat_map(fn {_client, items} -> items end)

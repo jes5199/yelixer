@@ -34,7 +34,10 @@ defmodule Yelixer.Types.Text do
   def to_string(%Doc{} = doc, type_name) do
     doc.store
     |> BlockStore.get_sequence(type_name)
-    |> Enum.map(fn %Item{content: {:string, s}} -> s end)
+    |> Enum.flat_map(fn
+      %Item{content: {:string, s}} -> [s]
+      _ -> []
+    end)
     |> Enum.join()
   end
 

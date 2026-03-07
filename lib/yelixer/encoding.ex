@@ -40,6 +40,21 @@ defmodule Yelixer.Encoding do
     decode_uint(rest, acc + Bitwise.bsl(value, shift), shift + 7)
   end
 
+  # --- Signed varint (zigzag encoding) ---
+
+  def encode_sint(n) when n >= 0, do: encode_uint(Bitwise.bsl(n, 1))
+  def encode_sint(n), do: encode_uint(Bitwise.bor(Bitwise.bsl(-n, 1), 1))
+
+  def decode_sint(binary) do
+    {n, rest} = decode_uint(binary)
+
+    if Bitwise.band(n, 1) == 1 do
+      {-Bitwise.bsr(n, 1) - 1, rest}
+    else
+      {Bitwise.bsr(n, 1), rest}
+    end
+  end
+
   # --- String ---
 
   def encode_string(s) do
@@ -334,16 +349,16 @@ defmodule Yelixer.Encoding do
     <<encode_uint(len)::binary, body::binary>>
   end
 
-  # Yjs Any encoding: type byte + value
-  # 119 = undefined, 120 = null, 121 = integer, 122 = float32,
-  # 123 = float64, 124 = bigint, 125 = false, 126 = true, 127 = string
-  # 116 = object, 117 = array
-  defp encode_any(nil), do: <<120>>
-  defp encode_any(true), do: <<126>>
-  defp encode_any(false), do: <<125>>
+  # lib0 Any encoding: type byte + value
+  # 116 = buffer, 117 = array, 118 = object, 119 = string,
+  # 120 = false, 121 = true, 122 = bigint, 123 = float64,
+  # 124 = float32, 125 = integer (zigzag), 126 = null, 127 = undefined
+  defp encode_any(nil), do: <<126>>
+  defp encode_any(true), do: <<121>>
+  defp encode_any(false), do: <<120>>
 
   defp encode_any(n) when is_integer(n) do
-    <<123, n::float-64>>
+    <<125, encode_sint(n)::binary>>
   end
 
   defp encode_any(f) when is_float(f) do
@@ -355,23 +370,36 @@ defmodule Yelixer.Encoding do
   end
 
   defp encode_any(list) when is_list(list) do
-    <<117, encode_uint(length(list))::binary,
-      (Enum.reduce(list, <<>>, fn v, acc -> <<acc::binary, encode_any(v)::binary>> end)
-       |> :erlang.iolist_to_binary())::binary>>
+    body = Enum.reduce(list, <<>>, fn v, acc -> <<acc::binary, encode_any(v)::binary>> end)
+    <<117, encode_uint(length(list))::binary, body::binary>>
   end
 
   defp encode_any(map) when is_map(map) do
-    <<116, encode_uint(map_size(map))::binary,
-      (Enum.reduce(map, <<>>, fn {k, v}, acc ->
-         <<acc::binary, encode_string(to_string(k))::binary, encode_any(v)::binary>>
-       end)
-       |> :erlang.iolist_to_binary())::binary>>
+    body =
+      Enum.reduce(map, <<>>, fn {k, v}, acc ->
+        <<acc::binary, encode_string(to_string(k))::binary, encode_any(v)::binary>>
+      end)
+
+    <<118, encode_uint(map_size(map))::binary, body::binary>>
   end
 
-  defp decode_any(<<120, rest::binary>>), do: {nil, rest}
-  defp decode_any(<<126, rest::binary>>), do: {true, rest}
-  defp decode_any(<<125, rest::binary>>), do: {false, rest}
+  @doc "Decode a lib0 Any value from binary. Returns {value, rest}."
+  def decode_any_value(binary), do: decode_any(binary)
+
+  defp decode_any(<<127, rest::binary>>), do: {nil, rest}
+  defp decode_any(<<126, rest::binary>>), do: {nil, rest}
+  defp decode_any(<<121, rest::binary>>), do: {true, rest}
+  defp decode_any(<<120, rest::binary>>), do: {false, rest}
   defp decode_any(<<123, f::float-64, rest::binary>>), do: {round_if_integer(f), rest}
+
+  defp decode_any(<<124, f::float-32, rest::binary>>), do: {round_if_integer(f), rest}
+
+  defp decode_any(<<125, rest::binary>>) do
+    {n, rest} = decode_sint(rest)
+    {n, rest}
+  end
+
+  defp decode_any(<<122, n::signed-64, rest::binary>>), do: {n, rest}
 
   defp decode_any(<<119, rest::binary>>) do
     decode_string(rest)
@@ -382,9 +410,15 @@ defmodule Yelixer.Encoding do
     decode_any_list(rest, len, [])
   end
 
-  defp decode_any(<<116, rest::binary>>) do
+  defp decode_any(<<118, rest::binary>>) do
     {len, rest} = decode_uint(rest)
     decode_any_map(rest, len, %{})
+  end
+
+  defp decode_any(<<116, rest::binary>>) do
+    {len, rest} = decode_uint(rest)
+    <<buf::binary-size(len), rest2::binary>> = rest
+    {buf, rest2}
   end
 
   defp decode_any_list(rest, 0, acc), do: {Enum.reverse(acc), rest}
@@ -444,36 +478,137 @@ defmodule Yelixer.Encoding do
     # Retry pending items whose dependencies are now available
     {doc, _sv} = retry_pending(doc, sv, pending)
 
-    # Apply delete set
+    # Apply delete set — work with ranges, splitting items at boundaries
     doc =
       Enum.reduce(Map.to_list(ds.clients), doc, fn {client, ranges}, doc ->
         Enum.reduce(ranges, doc, fn {start, stop}, doc ->
-          Enum.reduce(start..(stop - 1)//1, doc, fn clock, doc ->
-            store = Integrate.mark_deleted(doc.store, ID.new(client, clock))
-            %{doc | store: store}
-          end)
+          store = apply_delete_range(doc.store, client, start, stop - start)
+          %{doc | store: store}
         end)
       end)
 
     {:ok, doc}
   end
 
-  defp integrate_items([], doc, sv, pending), do: {doc, sv, Enum.reverse(pending)}
+  defp apply_delete_range(store, _client, _clock, 0), do: store
 
-  defp integrate_items([item | rest], doc, sv, pending) do
-    client_clock = StateVector.get(sv, item.id.client)
+  defp apply_delete_range(store, client, clock, remaining) do
+    case BlockStore.get(store, ID.new(client, clock)) do
+      nil ->
+        # Item not found, skip this clock
+        apply_delete_range(store, client, clock + 1, remaining - 1)
 
-    if item.id.clock < client_clock do
-      # Already have this item, skip
-      integrate_items(rest, doc, sv, pending)
-    else
-      case try_integrate_item(item, doc, sv) do
-        {:ok, doc, sv} ->
-          integrate_items(rest, doc, sv, pending)
+      item ->
+        offset = clock - item.id.clock
+        item_remaining = item.length - offset
+        to_delete = min(remaining, item_remaining)
 
-        :pending ->
-          integrate_items(rest, doc, sv, [item | pending])
-      end
+        # Split at start of deletion if needed
+        store =
+          if offset > 0 do
+            split_in_clients(store, client, item, offset)
+          else
+            store
+          end
+
+        # Re-fetch after potential split
+        item = BlockStore.get(store, ID.new(client, clock))
+
+        # Split at end of deletion if needed
+        store =
+          if to_delete < item.length do
+            split_in_clients(store, client, item, to_delete)
+          else
+            store
+          end
+
+        # Re-fetch and mark deleted
+        item = BlockStore.get(store, ID.new(client, clock))
+        store = mark_item_deleted(store, client, item)
+
+        apply_delete_range(store, client, clock + to_delete, remaining - to_delete)
+    end
+  end
+
+  defp split_in_clients(store, client, item, offset) do
+    {left, right} = Item.split(item, offset)
+
+    clients =
+      Map.update!(store.clients, client, fn blocks ->
+        idx = Enum.find_index(blocks, &(&1.id == item.id))
+
+        blocks
+        |> List.replace_at(idx, left)
+        |> List.insert_at(idx + 1, right)
+      end)
+
+    # Also update sequences if the item is in one
+    sequences =
+      Enum.reduce(store.sequences, store.sequences, fn {type_key, seq}, sequences ->
+        case Enum.find_index(seq, &(&1 == item.id)) do
+          nil -> sequences
+          idx -> Map.put(sequences, type_key, List.insert_at(seq, idx + 1, right.id))
+        end
+      end)
+
+    %{store | clients: clients, sequences: sequences}
+  end
+
+  defp mark_item_deleted(store, client, item) do
+    item_id = item.id
+
+    clients =
+      Map.update!(store.clients, client, fn blocks ->
+        Enum.map(blocks, fn
+          %Item{id: ^item_id} -> %{item | deleted: true}
+          other -> other
+        end)
+      end)
+
+    %{store | clients: clients}
+  end
+
+  defp integrate_items(items, doc, sv, pending) do
+    integrate_items(items, doc, sv, pending, MapSet.new())
+  end
+
+  defp integrate_items([], doc, sv, pending, _blocked_clients), do: {doc, sv, Enum.reverse(pending)}
+
+  defp integrate_items([item | rest], doc, sv, pending, blocked_clients) do
+    client = item.id.client
+    client_clock = StateVector.get(sv, client)
+
+    cond do
+      # If this client has a pending item with a lower clock, defer all subsequent items
+      # for that client to maintain contiguity (matching yrs behavior)
+      MapSet.member?(blocked_clients, client) ->
+        integrate_items(rest, doc, sv, [item | pending], blocked_clients)
+
+      item.id.clock + item.length <= client_clock ->
+        # Fully known — skip entirely
+        integrate_items(rest, doc, sv, pending, blocked_clients)
+
+      item.id.clock < client_clock ->
+        # Partial overlap — trim the already-known portion and integrate the rest
+        offset = client_clock - item.id.clock
+        {_left, trimmed} = Item.split(item, offset)
+        case try_integrate_item(trimmed, doc, sv) do
+          {:ok, doc, sv} ->
+            integrate_items(rest, doc, sv, pending, blocked_clients)
+
+          :pending ->
+            integrate_items(rest, doc, sv, [trimmed | pending], MapSet.put(blocked_clients, client))
+        end
+
+      true ->
+        # Completely new — integrate as-is
+        case try_integrate_item(item, doc, sv) do
+          {:ok, doc, sv} ->
+            integrate_items(rest, doc, sv, pending, blocked_clients)
+
+          :pending ->
+            integrate_items(rest, doc, sv, [item | pending], MapSet.put(blocked_clients, client))
+        end
     end
   end
 
@@ -485,21 +620,104 @@ defmodule Yelixer.Encoding do
   end
 
   defp try_integrate_item(item, doc, sv) do
-    item = resolve_parent(item, doc.store)
-    type_name = parent_type_name(item)
+    # Check for missing cross-client dependencies (origin and right_origin)
+    # matching yrs Update::missing() — defer if dependency not yet integrated
+    if has_missing_dep?(item, sv) do
+      :pending
+    else
+      item = resolve_parent(item, doc.store)
+      type_key = parent_type_key(item)
 
-    case type_name do
-      nil ->
-        # Can't resolve parent yet — defer for retry
-        :pending
+      case type_key do
+        nil ->
+          # Can't resolve parent yet — defer for retry
+          :pending
 
-      name ->
-        {doc, _} = Doc.get_or_create_type(doc, name, :unknown)
-        {:ok, store} = Integrate.integrate(doc.store, item, name)
-        sv = StateVector.advance(sv, item.id.client, item.id.clock + item.length)
-        {:ok, %{doc | store: store}, sv}
+        key ->
+          type_ref = infer_type_ref(item, doc)
+          {doc, _} = Doc.get_or_create_type(doc, key, type_ref)
+          {:ok, store} = Integrate.integrate(doc.store, item, key)
+          # Map conflict resolution: auto-delete loser when same key has competing items
+          store = maybe_resolve_map_conflict(store, item, key)
+          sv = StateVector.advance(sv, item.id.client, item.id.clock + item.length)
+          {:ok, %{doc | store: store}, sv}
+      end
     end
   end
+
+  defp has_missing_dep?(item, sv) do
+    missing_ref?(item.origin, item.id.client, sv) or
+      missing_ref?(item.right_origin, item.id.client, sv)
+  end
+
+  defp missing_ref?(nil, _item_client, _sv), do: false
+
+  defp missing_ref?(%ID{client: client, clock: clock}, item_client, sv) do
+    client != item_client and clock >= StateVector.get(sv, client)
+  end
+
+  # For items with parent_sub (map entries), resolve conflicts.
+  # In yrs: the RIGHTMOST item in the YATA sequence for a key wins.
+  # All other non-deleted items for the same key are auto-deleted.
+  defp maybe_resolve_map_conflict(store, %Item{parent_sub: nil}, _type_key), do: store
+  defp maybe_resolve_map_conflict(store, %Item{parent_sub: :inherit}, _type_key), do: store
+
+  defp maybe_resolve_map_conflict(store, %Item{parent_sub: sub}, type_key) do
+    seq_ids = Map.get(store.sequences, type_key, [])
+
+    # Find ALL non-deleted items with same parent_sub, with their sequence index
+    same_key_items =
+      seq_ids
+      |> Enum.with_index()
+      |> Enum.filter(fn {seq_id, _idx} ->
+        case BlockStore.get(store, seq_id) do
+          %Item{parent_sub: ^sub, deleted: false} -> true
+          _ -> false
+        end
+      end)
+
+    if length(same_key_items) <= 1 do
+      store
+    else
+      # Map conflict resolution: rightmost wins
+      # The RIGHTMOST (highest index) wins; delete all others
+      {_winner_id, winner_idx} = Enum.max_by(same_key_items, fn {_id, idx} -> idx end)
+
+      losers =
+        same_key_items
+        |> Enum.reject(fn {_id, idx} -> idx == winner_idx end)
+        |> Enum.map(fn {id, _idx} -> id end)
+
+      Enum.reduce(losers, store, fn loser_seq_id, store ->
+        case BlockStore.get(store, loser_seq_id) do
+          nil ->
+            store
+
+          loser ->
+            loser_id = loser.id
+
+            clients =
+              Map.update!(store.clients, loser_id.client, fn blocks ->
+                Enum.map(blocks, fn
+                  %Item{id: ^loser_id} = item -> %{item | deleted: true}
+                  other -> other
+                end)
+              end)
+
+            %{store | clients: clients}
+        end
+      end)
+    end
+  end
+
+  defp infer_type_ref(%Item{parent: {:id, %ID{} = id}}, %Doc{store: store}) do
+    case BlockStore.get(store, id) do
+      %Item{content: {:type, ref}} -> ref
+      _ -> :unknown
+    end
+  end
+
+  defp infer_type_ref(_, _), do: :unknown
 
   defp retry_pending(doc, sv, []), do: {doc, sv}
 
@@ -522,8 +740,9 @@ defmodule Yelixer.Encoding do
     end
   end
 
-  defp parent_type_name(%Item{parent: {:named, name}}), do: name
-  defp parent_type_name(_), do: nil
+  defp parent_type_key(%Item{parent: {:named, name}}), do: name
+  defp parent_type_key(%Item{parent: {:id, %ID{client: c, clock: k}}}), do: "__sub:#{c}:#{k}"
+  defp parent_type_key(_), do: nil
 
   defp resolve_parent(%Item{parent: {:infer, ref_id}} = item, store) when not is_nil(ref_id) do
     case BlockStore.get(store, ref_id) do
@@ -531,9 +750,16 @@ defmodule Yelixer.Encoding do
         item
 
       ref_item ->
+        # Inherit parent_sub from origin/right_origin if marked for inheritance
+        item =
+          if item.parent_sub == :inherit do
+            %{item | parent_sub: ref_item.parent_sub}
+          else
+            item
+          end
+
         case ref_item.parent do
           {:gc_placeholder, _} ->
-            # Origin is a GC block — find a non-GC sibling from same client
             case find_parent_from_siblings(store, ref_id.client) do
               nil -> item
               parent -> %{item | parent: parent}
@@ -631,9 +857,9 @@ defmodule Yelixer.Encoding do
         {{:infer, origin || right_origin}, rest}
       end
 
-    # Read parent_sub
+    # Read parent_sub — only encoded when parent is explicit (no origin/right_origin)
     {parent_sub, rest} =
-      if has_parent_sub do
+      if has_parent_sub and origin == nil and right_origin == nil do
         decode_string(rest)
       else
         {nil, rest}
@@ -643,6 +869,14 @@ defmodule Yelixer.Encoding do
     {content, rest} = decode_content(rest, content_ref)
 
     item = Item.new(ID.new(client, clock), origin, right_origin, content, parent, parent_sub)
+
+    # Mark that parent_sub needs inheritance if flag was set but not encoded
+    item =
+      if has_parent_sub and parent_sub == nil do
+        %{item | parent_sub: :inherit}
+      else
+        item
+      end
     next_clock = clock + item.length
 
     {item, rest, next_clock}
