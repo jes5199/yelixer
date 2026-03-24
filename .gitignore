@@ -28,3 +28,6 @@ yelixer-*.tar
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+y-crdt
+yjs
+.letta

@@ -82,8 +82,14 @@ defmodule Yelixer.Encoding do
   end
 
   def decode_state_vector(binary) do
-    {count, rest} = decode_uint(binary)
-    decode_sv_pairs(rest, count, StateVector.new())
+    try do
+      {count, rest} = decode_uint(binary)
+      {sv, rest} = decode_sv_pairs(rest, count, StateVector.new())
+      {:ok, {sv, rest}}
+    rescue
+      e in [MatchError, FunctionClauseError, ArgumentError] ->
+        {:error, {:malformed_state_vector, Exception.message(e)}}
+    end
   end
 
   defp decode_sv_pairs(rest, 0, sv), do: {sv, rest}
@@ -193,6 +199,13 @@ defmodule Yelixer.Encoding do
 
           items_bin =
             Enum.reduce(items, <<>>, fn item, iacc ->
+              item =
+                if item.deleted or DeleteSet.deleted?(ds, item.id.client, item.id.clock) do
+                  %{item | content: {:deleted, item.length}, deleted: true}
+                else
+                  item
+                end
+
               if item.id.clock < remote_clock do
                 # Partial item — only encode the portion after remote_clock
                 offset = remote_clock - item.id.clock
@@ -468,26 +481,30 @@ defmodule Yelixer.Encoding do
   # --- Update Decoding ---
 
   def apply_update(%Doc{} = doc, binary) do
-    {items, ds, _rest} = decode_update(binary)
+    case decode_update(binary) do
+      {:ok, {items, ds, _rest}} ->
+        # Filter out items we already have
+        sv = BlockStore.state_vector(doc.store)
 
-    # Filter out items we already have
-    sv = BlockStore.state_vector(doc.store)
+        {doc, sv, pending} = integrate_items(items, doc, sv, [])
 
-    {doc, sv, pending} = integrate_items(items, doc, sv, [])
+        # Retry pending items whose dependencies are now available
+        {doc, _sv} = retry_pending(doc, sv, pending)
 
-    # Retry pending items whose dependencies are now available
-    {doc, _sv} = retry_pending(doc, sv, pending)
+        # Apply delete set — work with ranges, splitting items at boundaries
+        doc =
+          Enum.reduce(Map.to_list(ds.clients), doc, fn {client, ranges}, doc ->
+            Enum.reduce(ranges, doc, fn {start, stop}, doc ->
+              store = apply_delete_range(doc.store, client, start, stop - start)
+              %{doc | store: store}
+            end)
+          end)
 
-    # Apply delete set — work with ranges, splitting items at boundaries
-    doc =
-      Enum.reduce(Map.to_list(ds.clients), doc, fn {client, ranges}, doc ->
-        Enum.reduce(ranges, doc, fn {start, stop}, doc ->
-          store = apply_delete_range(doc.store, client, start, stop - start)
-          %{doc | store: store}
-        end)
-      end)
+        {:ok, doc}
 
-    {:ok, doc}
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp apply_delete_range(store, _client, _clock, 0), do: store
@@ -535,7 +552,7 @@ defmodule Yelixer.Encoding do
 
     clients =
       Map.update!(store.clients, client, fn blocks ->
-        idx = Enum.find_index(blocks, &(&1.id == item.id))
+        {idx, _} = BlockStore.find_block_index(blocks, item.id.clock)
 
         blocks
         |> List.replace_at(idx, left)
@@ -552,20 +569,18 @@ defmodule Yelixer.Encoding do
       end)
 
     %{store | clients: clients, sequences: sequences}
+    |> BlockStore.refresh_tuple_cache(client)
   end
 
   defp mark_item_deleted(store, client, item) do
-    item_id = item.id
-
     clients =
       Map.update!(store.clients, client, fn blocks ->
-        Enum.map(blocks, fn
-          %Item{id: ^item_id} -> %{item | deleted: true}
-          other -> other
-        end)
+        {idx, _} = BlockStore.find_block_index(blocks, item.id.clock)
+        List.replace_at(blocks, idx, %{item | deleted: true})
       end)
 
     %{store | clients: clients}
+    |> BlockStore.refresh_tuple_cache(client)
   end
 
   defp integrate_items(items, doc, sv, pending) do
@@ -596,8 +611,11 @@ defmodule Yelixer.Encoding do
           {:ok, doc, sv} ->
             integrate_items(rest, doc, sv, pending, blocked_clients)
 
-          :pending ->
+          :pending_dep ->
             integrate_items(rest, doc, sv, [trimmed | pending], MapSet.put(blocked_clients, client))
+
+          :pending_parent ->
+            integrate_items(rest, doc, sv, [trimmed | pending], blocked_clients)
         end
 
       true ->
@@ -606,8 +624,11 @@ defmodule Yelixer.Encoding do
           {:ok, doc, sv} ->
             integrate_items(rest, doc, sv, pending, blocked_clients)
 
-          :pending ->
+          :pending_dep ->
             integrate_items(rest, doc, sv, [item | pending], MapSet.put(blocked_clients, client))
+
+          :pending_parent ->
+            integrate_items(rest, doc, sv, [item | pending], blocked_clients)
         end
     end
   end
@@ -623,15 +644,15 @@ defmodule Yelixer.Encoding do
     # Check for missing cross-client dependencies (origin and right_origin)
     # matching yrs Update::missing() — defer if dependency not yet integrated
     if has_missing_dep?(item, sv) do
-      :pending
+      :pending_dep
     else
       item = resolve_parent(item, doc.store)
       type_key = parent_type_key(item)
 
       case type_key do
         nil ->
-          # Can't resolve parent yet — defer for retry
-          :pending
+          # Can't resolve parent yet — defer for retry but don't block client
+          :pending_parent
 
         key ->
           type_ref = infer_type_ref(item, doc)
@@ -694,17 +715,14 @@ defmodule Yelixer.Encoding do
             store
 
           loser ->
-            loser_id = loser.id
-
             clients =
-              Map.update!(store.clients, loser_id.client, fn blocks ->
-                Enum.map(blocks, fn
-                  %Item{id: ^loser_id} = item -> %{item | deleted: true}
-                  other -> other
-                end)
+              Map.update!(store.clients, loser.id.client, fn blocks ->
+                {idx, _} = BlockStore.find_block_index(blocks, loser.id.clock)
+                List.replace_at(blocks, idx, %{loser | deleted: true})
               end)
 
             %{store | clients: clients}
+            |> BlockStore.refresh_tuple_cache(loser.id.client)
         end
       end)
     end
@@ -786,10 +804,15 @@ defmodule Yelixer.Encoding do
   end
 
   def decode_update(binary) do
-    {num_clients, rest} = decode_uint(binary)
-    {items, rest} = decode_clients(rest, num_clients, [])
-    {ds, rest} = decode_delete_set(rest)
-    {items, ds, rest}
+    try do
+      {num_clients, rest} = decode_uint(binary)
+      {items, rest} = decode_clients(rest, num_clients, [])
+      {ds, rest} = decode_delete_set(rest)
+      {:ok, {items, ds, rest}}
+    rescue
+      e in [MatchError, FunctionClauseError, ArgumentError] ->
+        {:error, {:malformed_update, Exception.message(e)}}
+    end
   end
 
   defp decode_clients(rest, 0, acc), do: {acc, rest}
