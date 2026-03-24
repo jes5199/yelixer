@@ -145,12 +145,13 @@ defmodule Yelixer.YrsDatasetTest do
 
   # lib0 Any decoding — correct tag mapping:
   # 116=buffer, 117=array, 118=object, 119=string
-  # 120=false, 121=true, 122=bigint, 123=float64
-  # 124=float32, 125=integer(zigzag), 126=null, 127=undefined
+  # 120=true, 121=false (lib0 convention: data ? 120 : 121)
+  # 122=bigint, 123=float64
+  # 124=float32, 125=integer(lib0 writeVarInt), 126=null, 127=undefined
   defp read_any(<<127, rest::binary>>), do: {nil, rest}
   defp read_any(<<126, rest::binary>>), do: {nil, rest}
-  defp read_any(<<121, rest::binary>>), do: {true, rest}
-  defp read_any(<<120, rest::binary>>), do: {false, rest}
+  defp read_any(<<120, rest::binary>>), do: {true, rest}
+  defp read_any(<<121, rest::binary>>), do: {false, rest}
   defp read_any(<<119, rest::binary>>), do: read_string(rest)
 
   defp read_any(<<123, f::float-64, rest::binary>>) do
@@ -163,9 +164,8 @@ defmodule Yelixer.YrsDatasetTest do
     {if(rounded == f, do: rounded, else: f), rest}
   end
 
-  defp read_any(<<125, rest::binary>>) do
-    {n, rest} = Encoding.decode_uint(rest)
-    {if(Bitwise.band(n, 1) == 1, do: -Bitwise.bsr(n, 1) - 1, else: Bitwise.bsr(n, 1)), rest}
+  defp read_any(<<125, _::binary>> = data) do
+    Encoding.decode_any_value(data)
   end
 
   defp read_any(<<122, n::signed-64, rest2::binary>>), do: {n, rest2}
